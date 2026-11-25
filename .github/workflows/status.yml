@@ -1,0 +1,99 @@
+name: Check sites and publish Pages
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: status-pages-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pages: read
+    steps:
+      - name: Check out the status site
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Check out the current Hachile directory
+        uses: actions/checkout@v4
+        with:
+          repository: GPDdev/site.hachile.org
+          ref: main
+          path: .source-site
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Prepare and validate the current directory
+        run: |
+          node scripts/sync-showcase.mjs .source-site/index.html
+          python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Check sites and save incident history
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous=()
+          if git ls-remote --exit-code --heads origin refs/heads/monitor-data > /dev/null; then
+            git fetch --depth=1 origin refs/heads/monitor-data
+            git worktree add --detach .monitor-state FETCH_HEAD
+            previous=(--previous .monitor-state/status.json)
+          else
+            result=$?
+            if [[ "$result" != 2 ]]; then exit "$result"; fi
+            git worktree add --detach .monitor-state HEAD
+            git -C .monitor-state switch --orphan monitor-data
+          fi
+          python3 scripts/check_sites.py --directory index.html --output data/status.json "${previous[@]}"
+          cp data/status.json .monitor-state/status.json
+          git -C .monitor-state add -- status.json
+          if ! git -C .monitor-state diff --cached --quiet; then
+            git -C .monitor-state -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Record site availability'
+            git -C .monitor-state push origin HEAD:refs/heads/monitor-data
+          fi
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Package public files
+        run: |
+          mkdir -p .pages/data
+          cp index.html style.css .pages/
+          cp -R assets .pages/assets
+          cp data/status.json .pages/data/status.json
+
+      - name: Upload Pages site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .pages
+
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish the checked snapshot
+        id: deployment
+        uses: actions/deploy-pages@v4
